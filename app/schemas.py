@@ -406,3 +406,126 @@ class AdjudicationAck(BaseModel):
     revision: int | None  # 本次操作产生的修订号；无修订为 null
     latest_revision: int  # 班次当前最新修订号
     revision_detail: RevisionRef | None = None  # 本次修订摘要；无修订为 null
+
+
+# ---------------------------------------------------------------- 停机损失费率表
+
+
+class RateEntryIn(_Interval):
+    """费率版本的一行：原因 + 整分钟半开生效区间 + 非负每分钟金额。
+
+    金额为非负十进制字符串（元，最多 6 位小数，如 "0"、"12.5"、"0.005"）；
+    同版本同原因的区间不得重叠（端点相接允许），不同原因可重叠。
+    """
+
+    reason: Reason
+    amount_per_minute: str = Field(
+        min_length=1,
+        max_length=32,
+        description="非负每分钟金额（十进制字符串，单位元，最多 6 位小数）",
+        examples=["12.5"],
+    )
+
+
+class RateVersionIn(BaseModel):
+    """发布一个完整费率版本：非空费率行列表整批原子发布。"""
+
+    entries: list[RateEntryIn] = Field(min_length=1)
+    note: str = Field(default="", max_length=500, description="版本说明（可选）")
+
+
+class RateEntryOut(BaseModel):
+    """费率行（回显规范十进制金额字符串，单位元）。"""
+
+    entry_no: int
+    start: datetime
+    end: datetime
+    reason: str
+    amount_per_minute: str
+
+
+class RateVersionOut(BaseModel):
+    """费率版本摘要。"""
+
+    device_id: str
+    version: int
+    note: str
+    entry_count: int
+    created_at: datetime
+
+
+class RateVersionDetailOut(RateVersionOut):
+    """费率版本完整费率表（按 entry_no 升序，即发布时的时间顺序）。"""
+
+    entries: list[RateEntryOut]
+
+
+# ---------------------------------------------------------------- 停机损失核算
+
+
+class LossAccountingIn(BaseModel):
+    """对已结算班次核算停机损失：指定修订（缺省最新）与费率版本。"""
+
+    rate_version: int = Field(ge=1, description="设备已发布的费率版本号")
+    revision: int | None = Field(
+        default=None, ge=1, description="归因修订号；缺省为该班次最新修订"
+    )
+
+
+class LossReasonTotal(BaseModel):
+    """单个原因的核算汇总。"""
+
+    reason: str
+    priced_minutes: int
+    unpriced_minutes: int
+    amount: str  # 金额（元，两位小数字符串）
+    amount_cents: int  # 金额（分，整数）
+
+
+class LossTotal(BaseModel):
+    """核算合计：逐段四舍五入后求和；待定价分钟单列、不计入金额。"""
+
+    amount: str
+    amount_cents: int
+    priced_minutes: int
+    unpriced_minutes: int
+    by_reason: list[LossReasonTotal]
+
+
+class PricedPieceOut(BaseModel):
+    """命中费率的切分明细：段金额已单独按分四舍五入。"""
+
+    piece_no: int
+    seg_no: int  # 来源固化归因段号
+    start: datetime
+    end: datetime
+    minutes: int
+    reason: str
+    rate_per_minute: str  # 每分钟费率（元，规范十进制）
+    amount: str  # 段金额（元，两位小数）
+    amount_cents: int  # 段金额（分）
+
+
+class UnpricedPieceOut(BaseModel):
+    """待定价切分明细：未匹配任何费率的停机分钟（有分钟、无金额）。"""
+
+    piece_no: int
+    seg_no: int | None  # 首个并入的固化归因段号（可能由相邻同原因段合并）
+    start: datetime
+    end: datetime
+    minutes: int
+    reason: str
+
+
+class LossAccountingOut(BaseModel):
+    """按 (班次, 修订, 费率版本) 固化的停机损失账；同组合重复核算幂等返回。"""
+
+    shift_id: int
+    device_id: str
+    revision: int
+    rate_version: int
+    idempotent: bool  # True 表示命中既有固化账，本次未产生新数据
+    totals: LossTotal
+    priced_pieces: list[PricedPieceOut]
+    unpriced_pieces: list[UnpricedPieceOut]
+    created_at: datetime

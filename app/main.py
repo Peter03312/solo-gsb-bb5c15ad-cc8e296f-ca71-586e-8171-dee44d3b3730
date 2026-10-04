@@ -30,6 +30,15 @@ from .schemas import (
     EventIn,
     EventPreviewOut,
     EventVersionRef,
+    LossAccountingIn,
+    LossAccountingOut,
+    LossReasonTotal,
+    LossTotal,
+    PricedPieceOut,
+    RateEntryOut,
+    RateVersionDetailOut,
+    RateVersionIn,
+    RateVersionOut,
     ReasonMinutes,
     RecomputedShift,
     ReconciledShiftRef,
@@ -46,8 +55,10 @@ from .schemas import (
     ShiftOut,
     ShiftSnapshotEntry,
     ShiftSnapshotPage,
+    UnpricedPieceOut,
     _check_ts,
 )
+from .pricing import format_cents, format_micro
 
 
 @asynccontextmanager
@@ -58,7 +69,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -77,7 +88,13 @@ app = FastAPI(
         "历史修订未固化明细时明确返回不可用；"
         "POST /devices/{device_id}/downtime-reconciliation 按固定变更序号对账现场"
         "停机记录与系统已结算归因（仅在已结算班次覆盖分钟比较，差异与未对账"
-        "分钟分别给出最大连续区间，结果携带所用序号以便重放）。"
+        "分钟分别给出最大连续区间，结果携带所用序号以便重放）；"
+        "POST /devices/{device_id}/rate-versions 按设备原子发布递增费率版本"
+        "（每行含原因、整分钟半开生效区间与非负每分钟金额，同版本同原因区间不重叠），"
+        "POST /shifts/{shift_id}/loss-accountings 对已结算班次指定修订与费率版本"
+        "核算停机损失：以修订固化归因段按费率边界切分，定点数逐段四舍五入到分后"
+        "汇总，未匹配费率的分钟单列待定价（不作零金额）；结果按"
+        "（班次, 修订, 费率版本）幂等固化，历史账不可改写。"
     ),
     lifespan=lifespan,
 )
@@ -683,3 +700,205 @@ def reconcile_downtime(device_id: str, payload: ReconciliationIn, db: Session = 
         unreconciled_minutes=result["unreconciled_minutes"],
         reconciled_shifts=[ReconciledShiftRef(**ref) for ref in result["reconciled_shifts"]],
     )
+
+
+# ---------------------------------------------------------------- 停机损失费率发布
+
+
+def _rate_entry_out(e) -> RateEntryOut:
+    return RateEntryOut(
+        entry_no=e.entry_no,
+        start=e.start_ts,
+        end=e.end_ts,
+        reason=e.reason,
+        amount_per_minute=format_micro(e.amount_per_minute),
+    )
+
+
+def _rate_version_detail_out(rv, entries) -> RateVersionDetailOut:
+    return RateVersionDetailOut(
+        device_id=rv.device_id,
+        version=rv.version,
+        note=rv.note,
+        entry_count=len(entries),
+        created_at=rv.created_at,
+        entries=[_rate_entry_out(e) for e in entries],
+    )
+
+
+@app.post(
+    "/devices/{device_id}/rate-versions",
+    response_model=RateVersionDetailOut,
+    status_code=201,
+    tags=["loss-accounting"],
+)
+def publish_rate_version_route(
+    device_id: str, payload: RateVersionIn, db: Session = Depends(get_db)
+):
+    """为设备原子发布一个递增费率版本（完整费率表）。
+
+    - 每行含原因、带时区的整分钟半开生效区间 [start, end) 与非负每分钟金额
+      （十进制字符串，元，最多 6 位小数）；同版本**同原因**区间不得重叠
+      （端点相接允许），不同原因可重叠；费率表不能为空；
+    - 版本号设备内连续递增（服务端分配）：并发发布在设备行锁内串行，
+      版本连续无缺口；版本与其全部费率行**同事务原子提交**，不存在发布一半；
+    - 已发布版本不可变；之后的发布只产生新版本（历史核算账引用的内容永不变）；
+    - 未知设备 404 DEVICE_NOT_FOUND；金额/原因/区间非法、空表或同原因重叠
+      → 422 RATE_ENTRY_INVALID（整批拒绝，不留下任何版本或费率行）。
+    """
+    rv, entries = services.publish_rate_version(db, device_id, payload)
+    return _rate_version_detail_out(rv, entries)
+
+
+@app.get(
+    "/devices/{device_id}/rate-versions",
+    response_model=list[RateVersionOut],
+    tags=["loss-accounting"],
+)
+def list_rate_versions_route(device_id: str, db: Session = Depends(get_db)):
+    """列出设备的全部费率版本（版本号降序，最新在前；仅摘要不含费率行）。"""
+    rows = services.list_rate_versions(db, device_id)
+    return [
+        RateVersionOut(
+            device_id=rv.device_id,
+            version=rv.version,
+            note=rv.note,
+            entry_count=count,
+            created_at=rv.created_at,
+        )
+        for rv, count in rows
+    ]
+
+
+@app.get(
+    "/devices/{device_id}/rate-versions/{version}",
+    response_model=RateVersionDetailOut,
+    tags=["loss-accounting"],
+)
+def get_rate_version_route(
+    device_id: str, version: int, db: Session = Depends(get_db)
+):
+    """读取设备某费率版本的完整费率表（按 entry_no 升序）。
+
+    未知设备 404 DEVICE_NOT_FOUND、未知版本 404 RATE_VERSION_NOT_FOUND。
+    """
+    rv, entries = services.get_rate_version(db, device_id, version)
+    return _rate_version_detail_out(rv, entries)
+
+
+# ---------------------------------------------------------------- 停机损失核算
+
+
+def _loss_accounting_out(accounting, pieces, idempotent: bool) -> LossAccountingOut:
+    by_reason = [
+        LossReasonTotal(
+            reason=reason,
+            priced_minutes=item["priced_minutes"],
+            unpriced_minutes=item["unpriced_minutes"],
+            amount=format_cents(item["amount_cents"]),
+            amount_cents=item["amount_cents"],
+        )
+        for reason, item in sorted(accounting.by_reason.items())
+    ]
+    totals = LossTotal(
+        amount=format_cents(accounting.total_cents),
+        amount_cents=accounting.total_cents,
+        priced_minutes=accounting.priced_minutes,
+        unpriced_minutes=accounting.unpriced_minutes,
+        by_reason=by_reason,
+    )
+    priced = [
+        PricedPieceOut(
+            piece_no=p.piece_no,
+            seg_no=p.seg_no,
+            start=p.start_ts,
+            end=p.end_ts,
+            minutes=p.minutes,
+            reason=p.reason,
+            rate_per_minute=format_micro(p.rate_per_minute),
+            amount=format_cents(p.amount_cents),
+            amount_cents=p.amount_cents,
+        )
+        for p in pieces
+        if p.priced
+    ]
+    unpriced = [
+        UnpricedPieceOut(
+            piece_no=p.piece_no,
+            seg_no=p.seg_no,
+            start=p.start_ts,
+            end=p.end_ts,
+            minutes=p.minutes,
+            reason=p.reason,
+        )
+        for p in pieces
+        if not p.priced
+    ]
+    return LossAccountingOut(
+        shift_id=accounting.shift_id,
+        device_id=accounting.device_id,
+        revision=accounting.revision,
+        rate_version=accounting.rate_version,
+        idempotent=idempotent,
+        totals=totals,
+        priced_pieces=priced,
+        unpriced_pieces=unpriced,
+        created_at=accounting.created_at,
+    )
+
+
+@app.post(
+    "/shifts/{shift_id}/loss-accountings",
+    response_model=LossAccountingOut,
+    tags=["loss-accounting"],
+)
+def account_shift_loss_route(
+    shift_id: int,
+    payload: LossAccountingIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """对已结算班次按 (修订, 费率版本) 核算停机损失并幂等固化。
+
+    - 用该修订**同事务固化的归因段**（半开、整分钟、互不重叠）按所选费率
+      版本的费率边界切分：命中费率的子段以**定点数**（内部微元整数）逐段
+      计算 `每分钟金额 × 分钟数`，按分**四舍五入（0.5 分向上）**，再把各段
+      金额汇总；未匹配费率的分钟**单列待定价**（有分钟、无金额），绝不按
+      零金额计入合计；
+    - 结果（账头 + 全部切分明细）按（班次, 修订, 费率版本）**幂等固化**：
+      同组合重复核算返回既有账（200，idempotent=true），首次 201；
+      后续费率发布或归因更正只产生新组合的新账，**历史账不可改写**；
+    - 并发发布与核算：发布在设备行锁内整事务原子完成，核算锁定班次行与
+      该费率版本行，只能读到并锁定一个**已完整提交的版本**；
+    - 未知班次 404 SHIFT_NOT_FOUND、未结算 404 RESULT_NOT_FOUND、
+      未知修订 404 REVISION_NOT_FOUND、该设备未知费率版本
+      404 RATE_VERSION_NOT_FOUND；修订无固化明细（结构引入前的历史修订）
+      → 422 SEGMENTS_UNAVAILABLE，不以当前状态推算。
+    """
+    accounting, pieces, created = services.account_shift_loss(
+        db, shift_id, payload.rate_version, payload.revision
+    )
+    response.status_code = 201 if not created else 200
+    return _loss_accounting_out(accounting, pieces, idempotent=created)
+
+
+@app.get(
+    "/shifts/{shift_id}/loss-accountings",
+    response_model=list[LossAccountingOut],
+    tags=["loss-accounting"],
+)
+def list_loss_accountings_route(
+    shift_id: int,
+    revision: int | None = Query(default=None, ge=1, description="按修订号过滤"),
+    rate_version: int | None = Query(
+        default=None, ge=1, description="按费率版本过滤"
+    ),
+    db: Session = Depends(get_db),
+):
+    """列出班次已固化的停机损失账（历史账不可改写；可按修订/费率版本过滤）。
+
+    每条为一次固化的完整账（合计、按原因汇总、定价/待定价切分明细）；
+    未知班次 404 SHIFT_NOT_FOUND；过滤条件无匹配时返回空列表。
+    """
+    _shift, rows = services.list_loss_accountings(db, shift_id, revision, rate_version)
+    return [_loss_accounting_out(accounting, pieces, True) for accounting, pieces in rows]

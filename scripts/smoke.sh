@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -206,3 +206,42 @@ req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00+
 echo "-- 对账非法窗口（缺时区 / start≥end）与未知设备：预期 422 / 404 --"
 req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00","end":"2026-10-02T00:00:00+08:00","field_intervals":[]}'
 req POST /devices/NOPE/downtime-reconciliation '{"start":"2026-10-02T00:00:00+08:00","end":"2026-10-01T00:00:00+08:00","field_intervals":[]}'
+
+echo "-- 费率发布 v1（完整费率表；故障全天 1 元/分、保养 2 元/分、待判 0 元/分），预期 201 version=1 --"
+req POST /devices/CNC-01/rate-versions '{"note":"2026Q4","entries":[
+  {"reason":"failure","start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","amount_per_minute":"1"},
+  {"reason":"maintenance","start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","amount_per_minute":"2"},
+  {"reason":"pending","start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","amount_per_minute":"0"}]}'
+
+echo "-- 费率发布 v2（仅故障费率，10:00 边界 1.5 元、其后 1 元；端点相接合法），预期 version=2 --"
+req POST /devices/CNC-01/rate-versions '{"entries":[
+  {"reason":"failure","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","amount_per_minute":"1.5"},
+  {"reason":"failure","start":"2026-10-01T11:00:00+08:00","end":"2026-10-02T00:00:00+08:00","amount_per_minute":"1"}]}'
+
+echo "-- 费率版本列表与读取 --"
+req GET /devices/CNC-01/rate-versions
+req GET /devices/CNC-01/rate-versions/1
+
+echo "-- 非法费率表（同原因区间重叠 / 负金额 / 空表）：预期 422 RATE_ENTRY_INVALID（整批不留痕）--"
+req POST /devices/CNC-01/rate-versions '{"entries":[
+  {"reason":"failure","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00","amount_per_minute":"1"},
+  {"reason":"failure","start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T13:00:00+08:00","amount_per_minute":"2"}]}'
+req POST /devices/CNC-01/rate-versions '{"entries":[
+  {"reason":"failure","start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","amount_per_minute":"-1"}]}'
+
+echo "-- 损失核算：班次 1 修订 1 × 费率版本 2（仅故障费率）；保养 60 分钟应单列待定价 --"
+req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":2}'
+
+echo "-- 同组合重复核算：预期 200 幂等（idempotent=true，内容与首次一致）--"
+req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":2}'
+
+echo "-- 新组合：修订 1 × 费率版本 1（全费率，无待定价），预期 201 新账 --"
+req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":1}'
+
+echo "-- 列出班次全部固化账（历史账不可改写，可按修订/费率版本过滤）--"
+req GET /shifts/1/loss-accountings
+req GET "/shifts/1/loss-accountings?revision=1&rate_version=1"
+
+echo "-- 损失核算错误：未知费率版本 404 / 历史修订无明细 422 SEGMENTS_UNAVAILABLE / 未知班次 404 --"
+req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":999}'
+req POST /shifts/9999/loss-accountings '{"rate_version":1}'
