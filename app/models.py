@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
@@ -11,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
+    Numeric,
     String,
     UniqueConstraint,
     func,
@@ -227,5 +229,188 @@ class ManualAdjudication(Base):
         ),
         CheckConstraint(
             "status IN ('active','revoked')", name="ck_adjudications_status"
+        ),
+    )
+
+
+class RateVersion(Base):
+    """设备停机损失费率表的一个已发布完整版本。
+
+    - 版本号按设备从 1 开始连续递增，由发布事务在设备行锁 + 版本号唯一约束
+      下原子分配；一次发布是"全或无"：所有费率行与版本头同事务提交，
+      发布后整版（头与行）不可变、不可删改，后续发布只产生新版本号；
+    - 核算只引用已提交的版本（共享锁固定一个完整版本），绝不读到半成品版本。
+    """
+
+    __tablename__ = "rate_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(
+        ForeignKey("devices.id"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("device_id", "version", name="uq_rate_version"),
+        CheckConstraint("version >= 1", name="ck_rate_version_positive"),
+    )
+
+
+class RateEntry(Base):
+    """费率表某版本中的一行费率。
+
+    - reason 在 [start_ts, end_ts)（带时区整分钟半开）内按 amount_per_minute
+      （非负定点金额，NUMERIC(18,6)，单位"元/分钟"）计费；
+    - 同一版本同一原因的生效区间不得重叠（应用层校验 + 数据库排他约束兜底，
+      端点相接不算重叠）；不同原因的区间允许重叠；
+    - 行只在发布事务内与其版本头同事务插入，之后不可变。
+    """
+
+    __tablename__ = "rate_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 行序号：发布时按 (起点, 终点, 原因) 排序，从 1 开始；核算明细按此回显
+    entry_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    amount_per_minute: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6), nullable=False
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["device_id", "version"],
+            ["rate_versions.device_id", "rate_versions.version"],
+            name="fk_rate_entry_version",
+        ),
+        UniqueConstraint(
+            "device_id", "version", "entry_no", name="uq_rate_entry_no"
+        ),
+        CheckConstraint("end_ts > start_ts", name="ck_rate_entries_valid_range"),
+        CheckConstraint(
+            "reason IN ('maintenance','failure','pending')",
+            name="ck_rate_entries_reason",
+        ),
+        CheckConstraint(
+            "amount_per_minute >= 0", name="ck_rate_entries_amount_nonneg"
+        ),
+    )
+
+
+class ShiftLossAccounting(Base):
+    """停机损失核算的幂等固化账：按 (班次, 归因修订, 费率版本) 唯一。
+
+    - 对已结算班次指定修订与费率版本核算：用该修订固化的归因段按费率边界
+      切分，逐段定点计算并按分四舍五入后汇总；未匹配费率的分钟单列待定价；
+    - 核算在该 (修订, 费率版本) 组合上幂等：同组合重复请求返回同一行已固化
+      结果（idempotent=true），绝不重算改写；
+    - 费率发布新版本或归因更正产生新修订后，只可能产生新组合的新账；
+      历史账行与明细只插入、不更新不删除。
+    - totals 为 JSONB：{total_amount, reason_amounts, reason_minutes,
+      priced_minutes, unpriced_minutes, unpriced_reason_minutes}
+    """
+
+    __tablename__ = "shift_loss_accountings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shift_id: Mapped[int] = mapped_column(
+        ForeignKey("shifts.id"), nullable=False, index=True
+    )
+    device_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    rate_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    totals: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["shift_id", "revision"],
+            ["shift_results.shift_id", "shift_results.revision"],
+            name="fk_loss_result",
+        ),
+        ForeignKeyConstraint(
+            ["device_id", "rate_version"],
+            ["rate_versions.device_id", "rate_versions.version"],
+            name="fk_loss_rate_version",
+        ),
+        UniqueConstraint(
+            "shift_id",
+            "revision",
+            "rate_version",
+            name="uq_loss_accounting_combo",
+        ),
+    )
+
+
+class ShiftLossAccountingLine(Base):
+    """损失账的切分明细：与账头同事务固化，之后不可变（只插入）。
+
+    - 每行一个原因与费率（或待定价）恒定的最大连续半开区间，按 line_no
+      （即起点升序）排列、互不重叠；
+    - priced=FALSE 时 amount_per_minute 与 rate_entry_no 为空、amount 记 0.00，
+      但语义是"未定价"而非零金额（待定价分钟另在账头汇总并返回待定价区间）。
+    """
+
+    __tablename__ = "shift_loss_accounting_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shift_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    rate_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    line_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    priced: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    amount_per_minute: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 6), nullable=True
+    )
+    # 已按分四舍五入的段金额（待定价行记 0.00）
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    rate_entry_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rate_start_ts: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    rate_end_ts: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["shift_id", "revision", "rate_version"],
+            [
+                "shift_loss_accountings.shift_id",
+                "shift_loss_accountings.revision",
+                "shift_loss_accountings.rate_version",
+            ],
+            name="fk_loss_line_accounting",
+        ),
+        UniqueConstraint(
+            "shift_id",
+            "revision",
+            "rate_version",
+            "line_no",
+            name="uq_loss_accounting_line",
+        ),
+        CheckConstraint("end_ts > start_ts", name="ck_loss_lines_valid_range"),
+        CheckConstraint("minutes > 0", name="ck_loss_lines_minutes_pos"),
+        CheckConstraint(
+            "reason IN ('maintenance','failure','pending')",
+            name="ck_loss_lines_reason",
+        ),
+        CheckConstraint(
+            "(priced AND amount_per_minute IS NOT NULL AND rate_entry_no IS NOT NULL) "
+            "OR (NOT priced AND amount_per_minute IS NULL AND rate_entry_no IS NULL)",
+            name="ck_loss_lines_priced_shape",
         ),
     )

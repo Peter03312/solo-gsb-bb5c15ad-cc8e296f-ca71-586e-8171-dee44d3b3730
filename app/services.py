@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from fastapi import HTTPException
 from sqlalchemy import and_, func, or_, select, update
@@ -14,7 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import attribution, reconciliation
+from . import attribution, loss_accounting, reconciliation
 from .attribution import EventView, RulingView
 from .config import settings
 from .models import (
@@ -23,7 +24,11 @@ from .models import (
     EventSource,
     EventVersion,
     ManualAdjudication,
+    RateEntry,
+    RateVersion,
     Shift,
+    ShiftLossAccounting,
+    ShiftLossAccountingLine,
     ShiftResult,
     ShiftResultSegment,
 )
@@ -1554,3 +1559,523 @@ def get_shift_snapshot(
             device_id, win_start, win_end, snapshot_seq, page[-1][0].id
         )
     return page, snapshot_seq, next_cursor
+
+
+# ---------------------------------------------------------------- 停机损失费率表
+
+
+def _rate_rows_ordered(entries: list) -> list[tuple[int, datetime, datetime, str, Decimal]]:
+    """把请求费率行规整为 (序号, start_utc, end_utc, reason, amount)，
+    序号按 (起点, 终点, 原因) 稳定排序从 1 开始。"""
+    rows = [
+        (_utc(item.start), _utc(item.end), item.reason, item.amount_per_minute)
+        for item in entries
+    ]
+    rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    return [(no, *row) for no, row in enumerate(rows, start=1)]
+
+
+def publish_rate_table(db: Session, device_id: str, payload) -> RateVersion:
+    """发布设备费率表的一个完整新版本（整版原子、发布后不可变）。
+
+    - 版本号按设备从 1 开始连续递增：在设备行锁内分配，与并发发布相互串行；
+    - 费率行与版本头在同一事务内全部插入，任一非法（原因非法、区间非整分钟、
+      金额为负/精度超限、同原因区间重叠）整体拒绝，不留半成品版本；
+    - 数据库同版本同原因区间排他约束兜底并发；发布成功后版本只读。
+    """
+    device = db.execute(
+        select(Device).where(Device.id == device_id).with_for_update()
+    ).scalar_one_or_none()
+    if device is None:
+        raise ApiError(404, "DEVICE_NOT_FOUND", f"unknown device: {device_id!r}")
+
+    ordered = _rate_rows_ordered(payload.entries)
+
+    # 应用层重叠校验（与数据库排他约束双保险；端点相接不算重叠）
+    views = [
+        loss_accounting.RateEntry(
+            reason=reason, start=s, end=e, amount_per_minute=amount
+        )
+        for _no, s, e, reason, amount in ordered
+    ]
+    overlaps = loss_accounting.find_overlaps(views)
+    if overlaps:
+        i, j = overlaps[0]
+        a, b = views[i], views[j]
+        raise ApiError(
+            422,
+            "RATE_OVERLAP",
+            f"rate entries for reason {a.reason!r} overlap in the same version: "
+            f"[{a.start.isoformat()}, {a.end.isoformat()}) vs "
+            f"[{b.start.isoformat()}, {b.end.isoformat()})",
+        )
+
+    latest = db.execute(
+        select(func.max(RateVersion.version)).where(RateVersion.device_id == device_id)
+    ).scalar()
+    version = (latest or 0) + 1
+
+    header = RateVersion(
+        device_id=device_id, version=version, entry_count=len(ordered)
+    )
+    db.add(header)
+    db.flush()  # 先取得版本头，外键行随后插入
+    for no, s, e, reason, amount in ordered:
+        db.add(
+            RateEntry(
+                device_id=device_id,
+                version=version,
+                entry_no=no,
+                start_ts=s,
+                end_ts=e,
+                reason=reason,
+                amount_per_minute=amount,
+            )
+        )
+    try:
+        db.commit()
+    except IntegrityError:  # 排他约束/唯一约束兜底（极端并发）
+        db.rollback()
+        raise ApiError(
+            422,
+            "RATE_OVERLAP",
+            "rate entries overlap for the same reason in this version "
+            "(or a concurrent publish raced); the whole version was rejected",
+        )
+    db.refresh(header)
+    return header
+
+
+def get_rate_version_or_404(
+    db: Session, device_id: str, version: int, *, for_share: bool = False
+) -> RateVersion:
+    """取设备的某已发布费率版本头；未知设备 / 未知版本分别明确报错。
+
+    for_share=True 时对版本头加共享锁：核算事务借此"锁定一个完整版本"，
+    与任何试图写该版本的事务串行（已发布版本不可变，实际效果是把版本固定
+    在该事务的读快照内，绝不读到发布中的半成品）。
+    """
+    get_device_or_404(db, device_id)
+    stmt = select(RateVersion).where(
+        RateVersion.device_id == device_id, RateVersion.version == version
+    )
+    if for_share:
+        # SELECT ... FOR SHARE：核算事务据此锁定一个已发布的完整版本，
+        # 与任何写该版本的事务串行（已发布版本不可变，实际效果是把该版本
+        # 固定在核算事务的读视图中，绝不读到发布中的半成品）。
+        stmt = stmt.with_for_update(read=True)
+    header = db.execute(stmt).scalar_one_or_none()
+    if header is None:
+        raise ApiError(
+            404,
+            "RATE_VERSION_NOT_FOUND",
+            f"device {device_id!r} has no rate table version {version}",
+        )
+    return header
+
+
+def list_rate_versions(db: Session, device_id: str) -> list[RateVersion]:
+    get_device_or_404(db, device_id)
+    return list(
+        db.execute(
+            select(RateVersion)
+            .where(RateVersion.device_id == device_id)
+            .order_by(RateVersion.version)
+        )
+        .scalars()
+        .all()
+    )
+
+
+def rate_entries_for(db: Session, device_id: str, version: int) -> list[RateEntry]:
+    return list(
+        db.execute(
+            select(RateEntry)
+            .where(
+                RateEntry.device_id == device_id,
+                RateEntry.version == version,
+            )
+            .order_by(RateEntry.entry_no)
+        )
+        .scalars()
+        .all()
+    )
+
+
+# ---------------------------------------------------------------- 停机损失核算
+
+
+def _frozen_segments(
+    db: Session, shift_id: int, rev: ShiftResult
+) -> list[ShiftResultSegment]:
+    return list(
+        db.execute(
+            select(ShiftResultSegment)
+            .where(
+                ShiftResultSegment.shift_id == shift_id,
+                ShiftResultSegment.revision == rev.revision,
+            )
+            .order_by(ShiftResultSegment.seg_no)
+        )
+        .scalars()
+        .all()
+    )
+
+
+def _money(value: Decimal) -> str:
+    """金额规范化为按分两位小数字符串（值本身已在算法层按分四舍五入）。"""
+    return f"{value.quantize(Decimal('0.01')):.2f}"
+
+
+def _rate_money(value: Decimal) -> str:
+    """费率（每分钟金额）规范化字符串：与 NUMERIC(18,6) 列一致，固定输出
+    最多 6 位小数并去掉尾随零（如 5 → "5"、1.00 → "1"、0.005 → "0.005"）。
+
+    全程定点、不经过浮点；调用方据此得到稳定可比较的字面量。
+    """
+    return format(value.normalize(), "f") if value != 0 else "0"
+
+
+def _build_accounting_response(
+    shift: Shift,
+    rev: ShiftResult,
+    latest_revision: int,
+    header: ShiftLossAccounting,
+    lines: list[ShiftLossAccountingLine],
+    idempotent: bool,
+) -> dict:
+    totals = header.totals
+    unpriced_ivs = []
+    for iv in totals["unpriced_intervals"]:
+        s = datetime.fromisoformat(iv["start"])
+        e = datetime.fromisoformat(iv["end"])
+        unpriced_ivs.append(
+            {
+                "start": s,
+                "end": e,
+                "minutes": int((e - s).total_seconds()) // 60,
+                "reason": iv["reason"],
+            }
+        )
+    unpriced_ivs.sort(key=lambda x: (x["start"], x["end"]))
+    return {
+        "shift_id": shift.id,
+        "device_id": shift.device_id,
+        "revision": rev.revision,
+        "latest_revision": latest_revision,
+        "rate_version": header.rate_version,
+        "idempotent": idempotent,
+        "lines": [
+            {
+                "line_no": ln.line_no,
+                "start": ln.start_ts,
+                "end": ln.end_ts,
+                "minutes": ln.minutes,
+                "reason": ln.reason,
+                "priced": ln.priced,
+                "amount_per_minute": (
+                    _rate_money(ln.amount_per_minute)
+                    if ln.amount_per_minute is not None
+                    else None
+                ),
+                "amount": _money(ln.amount),
+                "rate_entry_no": ln.rate_entry_no,
+                "rate_start": ln.rate_start_ts,
+                "rate_end": ln.rate_end_ts,
+            }
+            for ln in lines
+        ],
+        "total_amount": _money(Decimal(totals["total_amount"])),
+        "reason_amounts": {
+            k: _money(Decimal(totals["reason_amounts"][k])) for k in attribution.REASONS
+        },
+        "reason_minutes": {k: totals["reason_minutes"][k] for k in attribution.REASONS},
+        "priced_minutes": totals["priced_minutes"],
+        "unpriced_minutes": totals["unpriced_minutes"],
+        "unpriced_intervals": unpriced_ivs,
+    }
+
+
+def account_shift_loss(
+    db: Session, shift_id: int, revision: int, rate_version: int
+) -> tuple[dict, bool]:
+    """对已结算班次指定修订与费率版本核算停机损失（幂等固化）。
+
+    返回 (响应 dict, 是否幂等命中)。
+
+    - 修订必须已**同事务固化归因区间明细**：历史修订无明细（结构引入前生成、
+      当时裁定状态无法可靠还原）→ 422 SEGMENTS_UNAVAILABLE，绝不以当前状态推算；
+    - 费率版本必须是该设备已发布的完整版本（共享锁固定，避免读到发布中版本）；
+    - 用该修订固化归因段按费率边界切分，逐段定点计算、按分四舍五入后汇总；
+      未匹配费率的分钟单列待定价（不作零金额）；
+    - 按 (班次, 修订, 费率版本) 幂等：同组合重复请求返回先前固化的同一账
+      （idempotent=true），历史账不可改写；新费率发布或归因更正只产生新组合。
+    """
+    shift = get_shift_or_404(db, shift_id)
+
+    # 幂等快速路径：已固化组合直接返回（历史账不可变）
+    existing = db.execute(
+        select(ShiftLossAccounting).where(
+            ShiftLossAccounting.shift_id == shift_id,
+            ShiftLossAccounting.revision == revision,
+            ShiftLossAccounting.rate_version == rate_version,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        rev = db.execute(
+            select(ShiftResult).where(
+                ShiftResult.shift_id == shift_id, ShiftResult.revision == revision
+            )
+        ).scalar_one()
+        latest = _latest_revision(db, shift_id)
+        lines = (
+            db.execute(
+                select(ShiftLossAccountingLine)
+                .where(
+                    ShiftLossAccountingLine.shift_id == shift_id,
+                    ShiftLossAccountingLine.revision == revision,
+                    ShiftLossAccountingLine.rate_version == rate_version,
+                )
+                .order_by(ShiftLossAccountingLine.line_no)
+            )
+            .scalars()
+            .all()
+        )
+        return _build_accounting_response(
+            shift, rev, latest.revision, existing, list(lines), True
+        ), True
+
+    # 新组合：串行化该班次上的并发核算（固定加锁顺序：班次 → 费率版本）
+    shift = db.execute(
+        select(Shift).where(Shift.id == shift_id).with_for_update()
+    ).scalar_one()
+    rev = db.execute(
+        select(ShiftResult).where(
+            ShiftResult.shift_id == shift_id, ShiftResult.revision == revision
+        )
+    ).scalar_one_or_none()
+    if rev is None:
+        raise ApiError(
+            404,
+            "REVISION_NOT_FOUND",
+            f"shift id={shift_id} has no revision {revision}",
+        )
+
+    # 锁定一个完整费率版本（共享锁）：get_rate_version_or_404 已按班次所属
+    # 设备查找，未知设备/版本在此明确报 RATE_VERSION_NOT_FOUND；锁把该版本
+    # 固定在本事务读视图，绝不读到发布中的半成品版本。
+    get_rate_version_or_404(db, shift.device_id, rate_version, for_share=True)
+
+    if not rev.segments_available:
+        raise ApiError(
+            422,
+            "SEGMENTS_UNAVAILABLE",
+            f"shift id={shift_id} revision {revision} has no frozen result "
+            "segments; the historical ruling state cannot be reliably "
+            "reconstructed, so loss accounting is refused "
+            "(current state is never substituted)",
+        )
+    seg_rows = _frozen_segments(db, shift_id, rev)
+
+    # 并发核算同组合：持锁后复查一次，命中则返回已固化账（幂等）
+    existing = db.execute(
+        select(ShiftLossAccounting).where(
+            ShiftLossAccounting.shift_id == shift_id,
+            ShiftLossAccounting.revision == revision,
+            ShiftLossAccounting.rate_version == rate_version,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        latest = _latest_revision(db, shift_id)
+        lines = (
+            db.execute(
+                select(ShiftLossAccountingLine)
+                .where(
+                    ShiftLossAccountingLine.shift_id == shift_id,
+                    ShiftLossAccountingLine.revision == revision,
+                    ShiftLossAccountingLine.rate_version == rate_version,
+                )
+                .order_by(ShiftLossAccountingLine.line_no)
+            )
+            .scalars()
+            .all()
+        )
+        return _build_accounting_response(
+            shift, rev, latest.revision, existing, list(lines), True
+        ), True
+
+    seg_views = [
+        loss_accounting.AttributionSegmentView(
+            start=r.start_ts, end=r.end_ts, reason=r.reason
+        )
+        for r in seg_rows
+    ]
+    rate_rows = rate_entries_for(db, shift.device_id, rate_version)
+    rate_views = [
+        loss_accounting.RateEntry(
+            reason=r.reason,
+            start=r.start_ts,
+            end=r.end_ts,
+            amount_per_minute=Decimal(r.amount_per_minute),
+        )
+        for r in rate_rows
+    ]
+    result = loss_accounting.account_loss(seg_views, rate_views)
+
+    # 待定价最大连续区间（算法层已按原因合并），带原因以便核对
+    unpriced_line_map: dict[tuple[datetime, datetime], str] = {
+        (ln.start, ln.end): ln.reason for ln in result.lines if not ln.priced
+    }
+    totals = {
+        "total_amount": _money(result.total_amount),
+        "reason_amounts": {
+            k: _money(result.reason_amounts[k]) for k in attribution.REASONS
+        },
+        "reason_minutes": {
+            k: result.reason_minutes[k] for k in attribution.REASONS
+        },
+        "priced_minutes": result.priced_minutes,
+        "unpriced_minutes": result.unpriced_minutes,
+        "unpriced_reason_minutes": {
+            k: result.unpriced_reason_minutes[k] for k in attribution.REASONS
+        },
+        "unpriced_intervals": [
+            {
+                "start": s.isoformat(),
+                "end": e.isoformat(),
+                "reason": unpriced_line_map.get((s, e), ""),
+            }
+            for s, e in result.unpriced_intervals
+        ],
+    }
+    header = ShiftLossAccounting(
+        shift_id=shift_id,
+        device_id=shift.device_id,
+        revision=revision,
+        rate_version=rate_version,
+        totals=totals,
+    )
+    db.add(header)
+    db.flush()
+    for line_no, ln in enumerate(result.lines, start=1):
+        db.add(
+            ShiftLossAccountingLine(
+                shift_id=shift_id,
+                revision=revision,
+                rate_version=rate_version,
+                line_no=line_no,
+                start_ts=ln.start,
+                end_ts=ln.end,
+                reason=ln.reason,
+                minutes=ln.minutes,
+                priced=ln.priced,
+                amount_per_minute=ln.amount_per_minute,
+                amount=ln.amount,
+                rate_entry_no=ln.rate_entry_no,
+                rate_start_ts=ln.rate_start,
+                rate_end_ts=ln.rate_end,
+            )
+        )
+    try:
+        db.commit()
+    except IntegrityError:  # 并发同组合：唯一约束兜底，回退到幂等返回
+        db.rollback()
+        saved = db.execute(
+            select(ShiftLossAccounting).where(
+                ShiftLossAccounting.shift_id == shift_id,
+                ShiftLossAccounting.revision == revision,
+                ShiftLossAccounting.rate_version == rate_version,
+            )
+        ).scalar_one()
+        saved_rev = db.execute(
+            select(ShiftResult).where(
+                ShiftResult.shift_id == shift_id, ShiftResult.revision == revision
+            )
+        ).scalar_one()
+        latest = _latest_revision(db, shift_id)
+        saved_lines = (
+            db.execute(
+                select(ShiftLossAccountingLine)
+                .where(
+                    ShiftLossAccountingLine.shift_id == shift_id,
+                    ShiftLossAccountingLine.revision == revision,
+                    ShiftLossAccountingLine.rate_version == rate_version,
+                )
+                .order_by(ShiftLossAccountingLine.line_no)
+            )
+            .scalars()
+            .all()
+        )
+        return _build_accounting_response(
+            shift, saved_rev, latest.revision, saved, list(saved_lines), True
+        ), True
+
+    db.refresh(header)
+    latest = _latest_revision(db, shift_id)
+    saved_lines = (
+        db.execute(
+            select(ShiftLossAccountingLine)
+            .where(
+                ShiftLossAccountingLine.shift_id == shift_id,
+                ShiftLossAccountingLine.revision == revision,
+                ShiftLossAccountingLine.rate_version == rate_version,
+            )
+            .order_by(ShiftLossAccountingLine.line_no)
+        )
+        .scalars()
+        .all()
+    )
+    return _build_accounting_response(
+        shift, rev, latest.revision, header, list(saved_lines), False
+    ), False
+
+
+def get_loss_accounting(
+    db: Session, shift_id: int, revision: int, rate_version: int
+) -> dict:
+    """读取已固化的损失账（幂等重取）；组合不存在 → 404 LOSS_ACCOUNTING_NOT_FOUND。"""
+    shift = get_shift_or_404(db, shift_id)
+    # 先解析修订（未知修订给 REVISION_NOT_FOUND，与结果查询语义一致）
+    rev = db.execute(
+        select(ShiftResult).where(
+            ShiftResult.shift_id == shift_id, ShiftResult.revision == revision
+        )
+    ).scalar_one_or_none()
+    if rev is None:
+        raise ApiError(
+            404,
+            "REVISION_NOT_FOUND",
+            f"shift id={shift_id} has no revision {revision}",
+        )
+    header = db.execute(
+        select(ShiftLossAccounting).where(
+            ShiftLossAccounting.shift_id == shift_id,
+            ShiftLossAccounting.revision == revision,
+            ShiftLossAccounting.rate_version == rate_version,
+        )
+    ).scalar_one_or_none()
+    if header is None:
+        raise ApiError(
+            404,
+            "LOSS_ACCOUNTING_NOT_FOUND",
+            f"no loss accounting for shift id={shift_id} revision {revision} "
+            f"with rate version {rate_version}; create it via "
+            "POST /shifts/{id}/loss-accountings",
+        )
+    latest = _latest_revision(db, shift_id)
+    lines = (
+        db.execute(
+            select(ShiftLossAccountingLine)
+            .where(
+                ShiftLossAccountingLine.shift_id == shift_id,
+                ShiftLossAccountingLine.revision == revision,
+                ShiftLossAccountingLine.rate_version == rate_version,
+            )
+            .order_by(ShiftLossAccountingLine.line_no)
+        )
+        .scalars()
+        .all()
+    )
+    return _build_accounting_response(
+        shift, rev, latest.revision, header, list(lines), True
+    )

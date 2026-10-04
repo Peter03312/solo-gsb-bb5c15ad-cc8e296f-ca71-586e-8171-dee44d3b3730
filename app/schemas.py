@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -406,3 +407,151 @@ class AdjudicationAck(BaseModel):
     revision: int | None  # 本次操作产生的修订号；无修订为 null
     latest_revision: int  # 班次当前最新修订号
     revision_detail: RevisionRef | None = None  # 本次修订摘要；无修订为 null
+
+
+# ---------------------------------------------------------------- 停机损失费率表
+
+
+def _check_amount(v: Decimal) -> Decimal:
+    """费率金额校验：定点、非负、最多 6 位小数（不允许 NaN/Infinity）。"""
+    if not v.is_finite():
+        raise ValueError("amount must be a finite decimal number")
+    if v < 0:
+        raise ValueError("amount_per_minute must be non-negative")
+    # 归一化后取指数：Decimal('1.20') 指数为 -2；科学计数法同样适用
+    if v.as_tuple().exponent < -6:
+        raise ValueError("amount_per_minute may have at most 6 decimal places")
+    return v
+
+
+class RateEntryIn(_Interval):
+    """费率表一行：原因 + 带时区整分钟半开生效区间 + 非负每分钟金额。
+
+    金额为定点数：接受数字或字符串（如 12.5 或 "0.005"），按字面量转 Decimal，
+    全程不经过二进制浮点；最多 6 位小数。
+    """
+
+    reason: Reason
+    amount_per_minute: Decimal
+
+    @field_validator("amount_per_minute", mode="before")
+    @classmethod
+    def _amount_from_literal(cls, v):
+        # pydantic 会先把 JSON 数字解析为 float，这里强制按字符串字面量重建，
+        # 避免 0.1 之类输入变成二进制浮点（json 已提供原始值时直接取之）。
+        if isinstance(v, Decimal):
+            return v
+        if isinstance(v, bool):  # bool 是 int 子类，明确拒绝以免变成 0/1
+            raise ValueError("amount_per_minute must be a decimal number, not boolean")
+        if isinstance(v, int):
+            return Decimal(v)
+        if isinstance(v, float):
+            # 仍容忍数字形式：以最短往返文本转 Decimal，确定且与 JSON 字面一致
+            return Decimal(repr(v))
+        if isinstance(v, str):
+            try:
+                return Decimal(v)
+            except Exception:
+                raise ValueError("amount_per_minute must be a valid decimal string")
+        raise ValueError("amount_per_minute must be a number or decimal string")
+
+    @field_validator("amount_per_minute")
+    @classmethod
+    def _amount_rules(cls, v: Decimal) -> Decimal:
+        return _check_amount(v)
+
+
+class RateTablePublishIn(BaseModel):
+    """发布设备费率表的一个完整新版本：非空费率行列表（整版原子生效）。"""
+
+    entries: list[RateEntryIn] = Field(
+        min_length=1,
+        description="完整费率表（非空）；同版本同原因的半开生效区间不得重叠",
+    )
+
+
+class RateEntryOut(BaseModel):
+    """已发布费率行（整分钟半开，UTC 输出）。"""
+
+    entry_no: int
+    start: datetime
+    end: datetime
+    reason: str
+    amount_per_minute: Decimal  # 定点原始费率（非负，最多 6 位小数）
+
+
+class RateVersionOut(BaseModel):
+    """费率表一个已发布完整版本的回执。"""
+
+    device_id: str
+    version: int
+    entry_count: int
+    created_at: datetime
+    entries: list[RateEntryOut]
+
+
+# ---------------------------------------------------------------- 停机损失核算
+
+
+class LossLineOut(BaseModel):
+    """损失账的一行切分明细：原因与费率（或待定价）恒定的最大连续半开区间。"""
+
+    line_no: int
+    start: datetime
+    end: datetime
+    minutes: int
+    reason: str
+    priced: bool  # False 表示该区间未匹配到任何同原因费率（待定价，非零金额）
+    amount_per_minute: Decimal | None  # 待定价行为 null
+    amount: Decimal  # 每分钟费率 × 分钟数后按分四舍五入；待定价行为 0.00（语义为未定价）
+    rate_entry_no: int | None  # 依据的费率行序号；待定价行为 null
+    rate_start: datetime | None
+    rate_end: datetime | None
+
+
+class MoneyAmounts(BaseModel):
+    """按原因列示的定点金额小计（已按分四舍五入）。"""
+
+    maintenance: Decimal
+    failure: Decimal
+    pending: Decimal
+
+
+class LossUnpricedInterval(BaseModel):
+    """待定价的最大连续半开区间（UTC 输出）及原因与分钟数。"""
+
+    start: datetime
+    end: datetime
+    minutes: int
+    reason: str
+
+
+class LossAccountingOut(BaseModel):
+    """停机损失核算的幂等固化账（按 班次/修订/费率版本 唯一）。
+
+    - 逐行金额均为"每分钟费率 × 分钟数"按分四舍五入（ROUND_HALF_UP）后的定点值；
+      total_amount 等于各行（含各原因小计）四舍五入后金额之和；
+    - 未匹配费率的分钟不计零，而以 priced=false 的行与 unpriced_* 字段单列待定价；
+    - idempotent=true 表示同组合重复请求，返回的是先前固化、不可变的同一账。
+    """
+
+    shift_id: int
+    device_id: str
+    revision: int
+    latest_revision: int
+    rate_version: int
+    idempotent: bool
+    lines: list[LossLineOut]
+    total_amount: Decimal
+    reason_amounts: MoneyAmounts
+    reason_minutes: ReasonMinutes
+    priced_minutes: int
+    unpriced_minutes: int
+    unpriced_intervals: list[LossUnpricedInterval]
+
+
+class LossAccountingRequest(BaseModel):
+    """对已结算班次发起核算的请求体：指定归因修订与费率版本（二者均显式必填）。"""
+
+    revision: int = Field(ge=1, description="归因修订号（必须已固化归因区间明细）")
+    rate_version: int = Field(ge=1, description="已发布的完整费率表版本号")

@@ -49,9 +49,46 @@ def init_db(retries: int = 30, delay: float = 1.0) -> None:
     else:
         raise RuntimeError(f"cannot initialize database: {last_err}")
     _create_exclusion_constraint()
+    _create_rate_overlap_constraint()
     _migrate_change_feed()
     _migrate_adjudications()
     _migrate_segments()
+
+
+def _create_rate_overlap_constraint() -> None:
+    """为 rate_entries 增加"同版本同原因费率区间不重叠"的排他约束（半开 [)）。
+
+    依赖 btree_gist 扩展（班次排他约束已确保创建）；缺失时降级为仅应用层校验。
+    不同原因的区间允许重叠（费率只适用于同原因的归因段）。
+    """
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS btree_gist"))
+            conn.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        ALTER TABLE rate_entries
+                        ADD CONSTRAINT rate_entries_no_overlap_excl
+                        EXCLUDE USING gist (
+                            device_id WITH =,
+                            version WITH =,
+                            reason WITH =,
+                            tstzrange(start_ts, end_ts, '[)') WITH &&
+                        );
+                    EXCEPTION WHEN duplicate_object OR duplicate_table THEN
+                        NULL;
+                    END
+                    $$;
+                    """
+                )
+            )
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "btree_gist 不可用，未创建费率区间排他约束（应用层重叠校验仍生效）：%s",
+            exc,
+        )
 
 
 def _migrate_segments() -> None:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→损失核算 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -206,3 +206,45 @@ req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00+
 echo "-- 对账非法窗口（缺时区 / start≥end）与未知设备：预期 422 / 404 --"
 req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00","end":"2026-10-02T00:00:00+08:00","field_intervals":[]}'
 req POST /devices/NOPE/downtime-reconciliation '{"start":"2026-10-02T00:00:00+08:00","end":"2026-10-01T00:00:00+08:00","field_intervals":[]}'
+
+echo "-- 停机损失费率表：发布完整 v1（保养 1.00/分、故障 08-12 点 2.00、12-18 点 3.00），预期 201 version=1 --"
+req POST /devices/CNC-01/rate-tables '{"entries":[
+  {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T18:00:00+08:00","reason":"maintenance","amount_per_minute":"1.00"},
+  {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"failure","amount_per_minute":"2.00"},
+  {"start":"2026-10-01T12:00:00+08:00","end":"2026-10-01T18:00:00+08:00","reason":"failure","amount_per_minute":"3.00"}]}'
+
+echo "-- 费率校验：同原因重叠 422 RATE_OVERLAP（整版拒绝、不占版本号）；负金额/空表 422 --"
+req POST /devices/CNC-01/rate-tables '{"entries":[
+  {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T12:01:00+08:00","reason":"failure","amount_per_minute":"2.00"},
+  {"start":"2026-10-01T12:00:00+08:00","end":"2026-10-01T18:00:00+08:00","reason":"failure","amount_per_minute":"3.00"}]}'
+req POST /devices/CNC-01/rate-tables '{"entries":[]}'
+
+echo "-- 费率版本查询：列表与单版本；未知版本 404 RATE_VERSION_NOT_FOUND --"
+req GET /devices/CNC-01/rate-tables
+req GET /devices/CNC-01/rate-tables/1
+req GET /devices/CNC-01/rate-tables/99
+
+echo "-- 损失核算：班次 1 当前修订按费率 v1 切分计费（明细+合计，未定价为 0），首次 201 --"
+req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":1}'
+
+echo "-- 同组合重复核算：预期 200 且 idempotent=true，返回同一笔固化账 --"
+req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":1}'
+echo "-- GET 幂等重取同一笔账 --"
+req GET '/shifts/1/loss-accountings?revision=1&rate_version=1'
+
+echo "-- 发布费率 v2（故障 11:30 前 1.00、之后 3.00）后，(rev1,v2) 是新组合新账；旧账不变 --"
+req POST /devices/CNC-01/rate-tables '{"entries":[
+  {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T18:00:00+08:00","reason":"maintenance","amount_per_minute":"1.00"},
+  {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure","amount_per_minute":"1.00"},
+  {"start":"2026-10-01T11:30:00+08:00","end":"2026-10-01T18:00:00+08:00","reason":"failure","amount_per_minute":"3.00"}]}'
+req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":2}'
+echo "-- 历史账 (rev1,v1) 原样可读 --"
+req GET '/shifts/1/loss-accountings?revision=1&rate_version=1'
+echo "-- 从未核算的组合 GET：预期 404 LOSS_ACCOUNTING_NOT_FOUND --"
+req GET '/shifts/1/loss-accountings?revision=1&rate_version=9'
+
+echo "-- 核算错误路径：未知修订 404 / 设备无此费率版本 404 / 非正版本号 422 --"
+req POST /shifts/1/loss-accountings '{"revision":99,"rate_version":1}'
+req POST /shifts/1/loss-accountings '{"revision":1,"rate_version":99}'
+req POST /shifts/1/loss-accountings '{"revision":0,"rate_version":1}'
+req POST /shifts/99999/loss-accountings '{"revision":1,"rate_version":1}'

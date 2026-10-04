@@ -20,6 +20,11 @@
 **最后修订的固化明细**（三类归因段并集）代表系统停机，仅在已结算班次覆盖的分钟内比较，按时间
 顺序返回现场有/系统无、系统有/现场无的最大连续区间及分钟总数；覆盖外的现场分钟另计未对账、
 不算差异，结果携带所用序号以便重放。
+**停机损失核算**按设备发布递增版本的**完整费率表**（每行含原因、带时区整分钟
+半开生效区间与非负每分钟金额，同版本同原因区间不得重叠，发布整版原子），
+再对已结算班次指定修订与费率版本核算：用该修订固化的归因段按费率边界切分，
+逐段定点计费、按分四舍五入后汇总，未匹配费率的分钟单列**待定价**（不作零金额），
+结果按 (班次, 修订, 费率版本) 幂等固化、历史账不可改写。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -125,6 +130,38 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
   非法游标/超限页大小返回 `422`。
 - **错误**：未知设备 `404 DEVICE_NOT_FOUND`，非法区间 `422`，未结算 `404 RESULT_NOT_FOUND`，
   未知班次/修订 `404`。错误体统一为 `{"detail": {"code": "...", "message": "..."}}`。
+- **停机损失费率表**（按设备，版本化、整版原子、不可变）：
+  - `POST /devices/{id}/rate-tables` 一次发布**完整**费率表（非空行列表）：每行含
+    `reason`、带时区整分钟半开生效区间 `[start, end)` 与**非负**的每分钟金额
+    （定点数，接受数字或字符串如 `"12.5"`/`"0.005"`，最多 6 位小数，拒绝负数/NaN/
+    超过 6 位小数）；不同原因区间允许重叠，**同版本同一原因的区间不得重叠**
+    （端点相接不算重叠），违反 → `422 RATE_OVERLAP`，整版拒绝；
+  - 版本号按设备从 1 起连续递增：发布在设备行锁下分配版本号，费率行与版本头
+    **同事务**全部插入（任一非法整批回滚，无半成品版本可读），并发发布串行、
+    版本号连续无缺口；发布后该版本（头与行）永久只读，后续费率改动只能发布新版本；
+  - 费率行按 `(起点, 终点, 原因)` 排序编号 `entry_no`（从 1 起），发布回执与
+    `GET /devices/{id}/rate-tables[/{version}]` 均原样回显该编号与 UTC 区间。
+- **停机损失核算**（按修订 × 费率版本，幂等固化、历史不可改写）：
+  - `POST /shifts/{id}/loss-accountings` 对**已结算**班次显式指定 `revision` 与
+    `rate_version`：取该修订**同事务固化的归因区间明细**（历史修订无明细
+    → `422 SEGMENTS_UNAVAILABLE`，绝不以当前状态推算），以归因段端点与**同原因**
+    费率边界切成费率恒定的小片段；费率只按相同原因匹配，**不跨原因适用**；
+  - 每片段金额 = 每分钟费率 × 分钟数，以 `Decimal` 定点计算并**按分四舍五入**
+    （`ROUND_HALF_UP`，半分进位）；合计 = 各片段四舍五入**之后**再求和，
+    响应中 `total_amount` 恒等于各行 `amount` 之和（也是各原因 `reason_amounts` 之和）；
+  - 归因段内没有同原因费率覆盖的分钟**单列待定价**：输出 `priced=false` 的行
+    （`amount_per_minute/rate_entry_no` 为 null，`amount` 占位 `"0.00"` 但语义是
+    未定价而非零金额），并在 `unpriced_minutes` 与 `unpriced_intervals`
+    （带原因的最大连续半开区间）中汇总；零费率（金额 0）是**已定价**，不算待定价；
+  - 相邻且原因与费率行（或同为待定价）相同的片段合并为最大连续行，明细按起点排序；
+  - 账按 `(班次, 修订, 费率版本)` 唯一幂等：首次 `201`，同组合重复 POST 返回同一
+    固化账 `200 idempotent=true`，也可经 `GET .../loss-accountings?revision=&rate_version=`
+    重取；后续费率发布新版本或归因更正产生新修订，只生成**新组合的新账**，
+    历史账与明细只插入、永不更新删除；
+  - 并发：核算持班次行锁（固定加锁顺序 班次 → 费率版本）并对费率版本头加
+    `FOR SHARE` 共享锁，同组合并发只固化一次，核算绝不会读到发布中的半成品版本；
+  - 未知班次 `404 SHIFT_NOT_FOUND`、未结算/未知修订 `404 REVISION_NOT_FOUND`、
+    设备无此费率版本 `404 RATE_VERSION_NOT_FOUND`、修订号/版本号非正 `422 VALIDATION_ERROR`。
 
 ## API 一览
 
@@ -148,6 +185,11 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `GET` | `/changes?cursor=&limit=` | 变更同步：按全局递增游标分页读取结算/更正/裁定/撤销变更 |
 | `GET` | `/devices/{device_id}/shift-snapshots?start=&end=&seq=&limit=&cursor=` | 班次归因快照：按固定变更序号取与窗口相交、已结算班次的最后修订（首次接入/重建索引） |
 | `POST` | `/devices/{device_id}/downtime-reconciliation` | 按设备对账现场停机与系统已结算归因（固定序号、差异与未对账分钟分别给最大连续区间） |
+| `POST` | `/devices/{device_id}/rate-tables` | 发布设备停机损失费率表完整新版本（版本递增、整版原子、不可变；同原因区间重叠 422） |
+| `GET` | `/devices/{device_id}/rate-tables` | 设备全部已发布费率版本（含各行，按版本号升序） |
+| `GET` | `/devices/{device_id}/rate-tables/{version}` | 读取指定费率版本（含完整费率行） |
+| `POST` | `/shifts/{id}/loss-accountings` | 按 (修订, 费率版本) 核算停机损失（切分明细+合计+待定价分钟；同组合幂等固化，新账 201/命中 200） |
+| `GET` | `/shifts/{id}/loss-accountings?revision=&rate_version=` | 读取已固化损失账（组合未核算 404） |
 | `GET` | `/health` | 健康检查 |
 
 原因枚举：`maintenance`（保养）、`failure`（故障）、`pending`（待判）。
@@ -173,7 +215,10 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 422 | `INVALID_CURSOR` | 同步游标超过当前最大变更序号（客户端进度异常，需从较小游标重新同步）；快照续页游标损坏、伪造或与设备/窗口/快照序号不匹配 |
 | 422 | `INVALID_SNAPSHOT_SEQ` | 快照序号超过当前已提交的最大变更序号（可取 0 或当前最大序号） |
 | 422 | `INVALID_SEQ` | 对账序号超过当前已提交的最大变更序号（可取 0；省略则固定为当前最大序号） |
-| 422 | `SEGMENTS_UNAVAILABLE` | 对账所选班次在该序号下的最后修订未固化归因明细（结构引入前的历史修订，当时裁定状态无法可靠还原），拒绝以当前状态推算 |
+| 422 | `SEGMENTS_UNAVAILABLE` | 对账/核算所选修订未固化归因明细（结构引入前的历史修订，当时裁定状态无法可靠还原），拒绝以当前状态推算 |
+| 422 | `RATE_OVERLAP` | 同一费率版本中同一原因的半开生效区间重叠（端点相接不算重叠）；整版拒绝，不留半成品 |
+| 404 | `RATE_VERSION_NOT_FOUND` | 设备不存在指定费率版本（或该版本属于其他设备） |
+| 404 | `LOSS_ACCOUNTING_NOT_FOUND` | 指定 (班次, 修订, 费率版本) 组合尚未核算（GET 读取时），需先 POST 创建 |
 
 ## 调用示例
 
@@ -854,6 +899,189 @@ curl -X POST http://localhost:8000/devices/CNC-01/downtime-reconciliation -H 'Co
 # 窗口缺时区 / 未对齐整分钟 / start≥end、现场区间非法 → 422 VALIDATION_ERROR；未知设备 → 404
 ```
 
+## 停机损失费率与损失核算
+
+在归因结果（各原因停机分钟）之外，财务侧可进一步把停机分钟折算为损失金额：
+先按设备发布**版本化完整费率表**，再对已结算班次的指定修订按指定费率版本核算。
+费率版本与归因修订都是只追加的不可变历史，二者组合唯一确定一笔**幂等固化的账**。
+
+**1. 发布费率表 v1**：保养 08:00–18:00 每分钟 1.00；故障 08:00–12:00 每分钟 2.00、
+12:00–18:00 每分钟 3.00（同原因区间端点相接，合法）
+
+```bash
+curl -X POST http://localhost:8000/devices/CNC-01/rate-tables \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[
+    {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T18:00:00+08:00",
+     "reason":"maintenance","amount_per_minute":"1.00"},
+    {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T12:00:00+08:00",
+     "reason":"failure","amount_per_minute":"2.00"},
+    {"start":"2026-10-01T12:00:00+08:00","end":"2026-10-01T18:00:00+08:00",
+     "reason":"failure","amount_per_minute":"3.00"}
+  ]}'
+```
+
+```json
+{
+  "device_id": "CNC-01", "version": 1, "entry_count": 3,
+  "created_at": "2026-10-04T10:00:00Z",
+  "entries": [
+    {"entry_no": 1, "start": "2026-10-01T00:00:00Z", "end": "2026-10-01T04:00:00Z",
+     "reason": "failure", "amount_per_minute": "2"},
+    {"entry_no": 2, "start": "2026-10-01T00:00:00Z", "end": "2026-10-01T10:00:00Z",
+     "reason": "maintenance", "amount_per_minute": "1"},
+    {"entry_no": 3, "start": "2026-10-01T04:00:00Z", "end": "2026-10-01T10:00:00Z",
+     "reason": "failure", "amount_per_minute": "3"}
+  ]
+}
+```
+
+> 金额为定点数：字符串 `"1.00"` 与数字 `1` 等价，输出规范化去掉尾随零（`"1"`），
+> 全程不经过二进制浮点；费率最多 6 位小数。行号按 (起点, 终点, 原因) 排序，
+> 与请求顺序无关，核算明细按此编号回显依据费率行。
+
+**2. 发布校验**：同原因区间重叠 / 负金额 / 非法时间一律 422，整版拒绝、不占版本号
+
+```bash
+# 同原因重叠一分钟 → 422 RATE_OVERLAP（此前成功的 v1 仍在，下一次发布仍是 v2）
+curl -X POST http://localhost:8000/devices/CNC-01/rate-tables -H 'Content-Type: application/json' \
+  -d '{"entries":[
+    {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T12:01:00+08:00",
+     "reason":"failure","amount_per_minute":"2"},
+    {"start":"2026-10-01T12:00:00+08:00","end":"2026-10-01T18:00:00+08:00",
+     "reason":"failure","amount_per_minute":"3"}]}'
+
+# 负金额 / 超 6 位小数 / 缺时区 / 秒非 00 / 空列表 → 422 VALIDATION_ERROR
+curl -X POST http://localhost:8000/devices/CNC-01/rate-tables -H 'Content-Type: application/json' \
+  -d '{"entries":[{"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T09:00:00+08:00",
+                   "reason":"failure","amount_per_minute":"-0.01"}]}'
+
+# 查询版本列表 / 单个版本
+curl http://localhost:8000/devices/CNC-01/rate-tables
+curl http://localhost:8000/devices/CNC-01/rate-tables/1   # 未知版本 404 RATE_VERSION_NOT_FOUND
+```
+
+**3. 核算**（接续主流程第 6 步：班次 1 修订 1 = 保养 60 / 故障 60；
+保养 10:00–11:00，故障 11:00–12:00）
+
+```bash
+curl -X POST http://localhost:8000/shifts/1/loss-accountings \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":1,"rate_version":1}'
+```
+
+```json
+{
+  "shift_id": 1, "device_id": "CNC-01",
+  "revision": 1, "latest_revision": 1, "rate_version": 1,
+  "idempotent": false,
+  "lines": [
+    {"line_no": 1, "start": "2026-10-01T02:00:00Z", "end": "2026-10-01T03:00:00Z",
+     "minutes": 60, "reason": "maintenance", "priced": true,
+     "amount_per_minute": "1", "amount": "60.00",
+     "rate_entry_no": 2, "rate_start": "2026-10-01T00:00:00Z", "rate_end": "2026-10-01T10:00:00Z"},
+    {"line_no": 2, "start": "2026-10-01T03:00:00Z", "end": "2026-10-01T04:00:00Z",
+     "minutes": 60, "reason": "failure", "priced": true,
+     "amount_per_minute": "2", "amount": "120.00",
+     "rate_entry_no": 1, "rate_start": "2026-10-01T00:00:00Z", "rate_end": "2026-10-01T04:00:00Z"}
+  ],
+  "total_amount": "180.00",
+  "reason_amounts": {"maintenance": "60.00", "failure": "120.00", "pending": "0.00"},
+  "reason_minutes": {"maintenance": 60, "failure": 60, "pending": 0},
+  "priced_minutes": 120,
+  "unpriced_minutes": 0,
+  "unpriced_intervals": []
+}
+```
+
+> 故障段 11:00–12:00 整体落在故障费率 08:00–12:00（每分钟 2.00）内 → 120.00；
+> 若归因段跨越 12:00 的费率边界，会在边界处切分成多行分别计费。
+> 每行 `amount` 是"每分钟费率 × 分钟数"按分四舍五入（ROUND_HALF_UP）的结果，
+> `total_amount` 等于各行之和。
+
+**4. 费率边界切分与按分四舍五入**：费率在 11:30 涨价时，故障段 [11:00,12:00)
+被切成 30 + 30 分钟两行
+
+```bash
+# 发布 v2：故障 11:30 前每分钟 1.00，之后每分钟 3.00（保养每分钟 1.00）
+curl -X POST http://localhost:8000/devices/CNC-01/rate-tables -H 'Content-Type: application/json' \
+  -d '{"entries":[
+    {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T18:00:00+08:00",
+     "reason":"maintenance","amount_per_minute":"1"},
+    {"start":"2026-10-01T08:00:00+08:00","end":"2026-10-01T11:30:00+08:00",
+     "reason":"failure","amount_per_minute":"1"},
+    {"start":"2026-10-01T11:30:00+08:00","end":"2026-10-01T18:00:00+08:00",
+     "reason":"failure","amount_per_minute":"3"}]}'
+# → version=2
+
+curl -X POST http://localhost:8000/shifts/1/loss-accountings -H 'Content-Type: application/json' \
+  -d '{"revision":1,"rate_version":2}'
+# 保养 60×1=60.00；故障 30×1=30.00 + 30×3=90.00 → total 180.00
+```
+
+逐段取整后再汇总在小费率上可观察到差异：若费率按分钟切成多行且每行每分钟
+`0.005`，则每行 1 分钟 × 0.005 各自四舍五入为 `0.01`，60 行合计 `0.60`
+（而不是 60×0.005=0.30 再整体取整）。
+
+**5. 未匹配费率的分钟 → 待定价（不作零金额）**
+
+```bash
+# v3 只给保养定价；故障 60 分钟无同原因费率
+curl -X POST http://localhost:8000/devices/CNC-01/rate-tables -H 'Content-Type: application/json' \
+  -d '{"entries":[{"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00",
+                   "reason":"maintenance","amount_per_minute":"2"}]}'
+# → version=3
+curl -X POST http://localhost:8000/shifts/1/loss-accountings -H 'Content-Type: application/json' \
+  -d '{"revision":1,"rate_version":3}'
+```
+
+```json
+{
+  "lines": [
+    {"line_no": 1, "start": "2026-10-01T02:00:00Z", "end": "2026-10-01T03:00:00Z",
+     "minutes": 60, "reason": "maintenance", "priced": true,
+     "amount_per_minute": "2", "amount": "120.00", "rate_entry_no": 1, "...": "..."},
+    {"line_no": 2, "start": "2026-10-01T03:00:00Z", "end": "2026-10-01T04:00:00Z",
+     "minutes": 60, "reason": "failure", "priced": false,
+     "amount_per_minute": null, "amount": "0.00",
+     "rate_entry_no": null, "rate_start": null, "rate_end": null}
+  ],
+  "total_amount": "120.00",
+  "priced_minutes": 60, "unpriced_minutes": 60,
+  "unpriced_intervals": [
+    {"start": "2026-10-01T03:00:00Z", "end": "2026-10-01T04:00:00Z",
+     "minutes": 60, "reason": "failure"}
+  ]
+}
+```
+
+> 费率只按**相同原因**匹配：保养费率不会套到故障分钟。待定价行的 `amount`
+> 占位为 `"0.00"` 仅因金额字段非空，其含义是"尚无价格、不计入合计"，
+> 与显式零费率（`amount_per_minute="0"` 的已定价行，计入 `priced_minutes`）严格区分。
+
+**6. 幂等固化与历史不可改写**
+
+```bash
+# 同 (班次, 修订, 费率版本) 再请求 → 200，idempotent=true，返回同一笔账（明细逐字节相同）
+curl -X POST http://localhost:8000/shifts/1/loss-accountings -H 'Content-Type: application/json' \
+  -d '{"revision":1,"rate_version":1}'
+# 也可直接 GET 重取（参数必填）
+curl 'http://localhost:8000/shifts/1/loss-accountings?revision=1&rate_version=1'
+
+# 发布 v4 或归因更正产生修订 2 后：旧账 (rev1,v1) 原样可读，新组合 (rev1,v4)/(rev2,...)
+# 各自独立成账、互不影响；GET 一个从未核算的组合 → 404 LOSS_ACCOUNTING_NOT_FOUND
+```
+
+**7. 拒绝路径**
+
+```bash
+# 历史修订无固化明细（结构引入前生成）→ 422 SEGMENTS_UNAVAILABLE（不以当前状态推算）
+curl -X POST http://localhost:8000/shifts/1/loss-accountings -H 'Content-Type: application/json' \
+  -d '{"revision":1,"rate_version":1}'
+# 未知班次 404 SHIFT_NOT_FOUND；未结算/未知修订 404 REVISION_NOT_FOUND；
+# 设备无此费率版本 404 RATE_VERSION_NOT_FOUND；revision/rate_version 非正 → 422
+```
+
 ## 设计要点
 
 - **归因算法**（`app/attribution.py`，纯标准库可独立测试）：按原因收集区间并裁剪到班次窗口；
@@ -919,14 +1147,33 @@ curl -X POST http://localhost:8000/devices/CNC-01/downtime-reconciliation -H 'Co
   序号选取复用班次快照的"每组最大修订号"子查询；所选修订 `segments_available=FALSE`
   （明细结构引入前的历史修订，裁定状态无法可靠还原）或序号越界时整体拒绝，
   绝不用当前状态替代；响应回传固定序号与各班次所选修订，可原样重放。
+- **停机损失费率表**：`rate_versions`（设备 + 连续版本号，设备行锁内分配）与
+  `rate_entries`（行号按 (起点, 终点, 原因) 排序）在同一事务内整版插入，
+  发布后两表只追加不更新；`rate_entries` 上有
+  `btree_gist` 排他约束兜底"同设备同版本同原因区间不重叠"
+  （半开 `[)`，端点相接允许），配合非负金额 `CHECK` 与应用层校验双保险；
+  任一费率行非法（负金额、精度 >6、区间重叠等）整版回滚，无半成品版本可读。
+- **停机损失核算**（`app/loss_accounting.py`，纯标准库可独立测试）：
+  以归因段端点与**同原因**费率行边界求并集，把停机分钟切成费率恒定的原子片段
+  （费率只匹配同原因段，绝不跨原因）；逐片段 `Decimal` 定点计算
+  `每分钟费率 × 分钟数` 并 `quantize(0.01, ROUND_HALF_UP)`，再合并相邻且
+  原因/费率行相同（或同为待定价）的片段；合计为各片段**取整后**之和，
+  因此响应中各行金额之和恒等于合计；未命中任何同原因费率的片段以 `priced=false`
+  输出并在账头汇总待定价分钟与最大连续区间（语义非零金额）。账头
+  `shift_loss_accountings` 以 `(shift_id, revision, rate_version)` 唯一约束，
+  明细 `shift_loss_accounting_lines` 同事务固化、之后只读；核算事务持班次行锁
+  （固定加锁顺序：班次 → 费率版本）并对费率版本头加 `FOR SHARE`：同组合并发
+  只固化一次（唯一约束再兜底），且核算不会读到发布中的半成品版本；后续费率
+  发布或归因更正只能产生新组合的新账，历史账行永不重写。
 
 ## 项目结构
 
 ```
 app/
   main.py         # FastAPI 路由
-  services.py     # 业务逻辑：版本链、幂等、结算、更正重算
+  services.py     # 业务逻辑：版本链、幂等、结算、更正重算、费率发布、损失核算固化
   attribution.py  # 归因算法（半开区间运算，纯标准库）
+  loss_accounting.py # 停机损失核算算法（费率边界切分/定点按分四舍五入/待定价，纯标准库）
   reconciliation.py # 现场-系统对账算法（裁剪/覆盖/差集，纯标准库）
   models.py       # SQLAlchemy 模型
   schemas.py      # Pydantic 请求/响应与校验
@@ -935,6 +1182,7 @@ app/
 tests/
   test_attribution.py    # 算法单测（含裁定覆盖/重叠/回退与区间明细拆段合并，无外部依赖，可 python3 直接跑）
   test_reconciliation.py # 对账算法单测（裁剪合并/覆盖差集/未对账/最大连续区间，无外部依赖，可 python3 直接跑）
+  test_loss_accounting.py # 损失核算算法单测（费率切分/定点按分四舍五入/合并/待定价/同原因不跨用/重叠校验，无外部依赖，可直接跑）
   test_api.py            # API 端到端测试（需 PostgreSQL）
   test_changes.py        # 变更同步（游标分页/回放/并发）端到端测试（需 PostgreSQL）
   test_adjudications.py  # 现场裁定（提交/幂等/冲突/撤销/联动/并发）端到端测试（需 PostgreSQL）
@@ -943,6 +1191,7 @@ tests/
   test_shift_snapshots.py  # 班次快照（固定序号/相交过滤/稳定翻页/不可变/游标校验）端到端测试（需 PostgreSQL）
   test_result_segments.py  # 归因区间明细（固化/不可变/依据形态/历史不可用/错误语义）端到端测试（需 PostgreSQL）
   test_downtime_reconciliation.py  # 现场停机对账（固定序号/最后修订明细并集/覆盖内外/未对账/序号越界与明细不可用）端到端测试（需 PostgreSQL）
+  test_loss_accounting_api.py  # 费率发布（递增/原子/重叠拒绝/并发连续）与损失核算（切分/四舍五入/待定价/幂等固化/历史不可改写/并发只固化一次）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```
